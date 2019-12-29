@@ -1,0 +1,6 @@
+Flask==1.1.1
+gunicorn==19.9.0
+numpy==1.17.2
+scipy==1.4.0
+pandas==0.25.3
+autograd==1.3
