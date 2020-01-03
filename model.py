@@ -117,10 +117,38 @@ def walshca(t, tdel, tdur):
     )
 
 
+def dm61_nonlinear(t, tdel, tdur, percent_end_of_rise=0.15, percent_start_of_fall=0.5):
+    scale = 2. / (1. + percent_start_of_fall - percent_end_of_rise)
+    percent_time = t/tdur
+
+    def percent_absorbed(t):
+        if t < 0.:
+            return 0.
+        if t < percent_end_of_rise:
+            return 0.5*scale*math.pow(t, 2.0) / percent_end_of_rise
+        if t >= percent_end_of_rise and t < percent_start_of_fall:
+            return scale * (t - 0.5*percent_end_of_rise)
+        if t >= percent_start_of_fall and t < 1.0:
+            return scale * (percent_start_of_fall - 0.5 * percent_end_of_rise +
+                            (t - percent_start_of_fall) *
+                            (1.0 - 0.5 * (t - percent_start_of_fall) / (1.0 - percent_start_of_fall)))
+        return 1.0
+
+    absorbed = np.array([percent_absorbed(t) for t in percent_time])
+    shifted = np.zeros_like(absorbed)
+    shifted[1:] = absorbed[:len(absorbed)-1]
+    coeffs = absorbed - shifted
+    return coeffs
+
+
+carb_curve = dm61_nonlinear
+
+
 def apply_carb_curve(column):
     assert column.ctype == "carb"
 
-    coeffs = walshca(Wtime, column.meta["delay"] / 5, column.meta["duration"] / 5)
+    coeffs = carb_curve(
+        Wtime, column.meta["delay"] / 5, column.meta["duration"] / 5)
     coeffs = np.flip(coeffs, 0)
 
     return column.series.rolling(window=Whoriz).apply(
@@ -132,13 +160,16 @@ def make_pandas_frame(frame):
     # Iterate through the columns, transforming them,
     # return a combined data frame.
 
-    insulin = pd.Series()
-    carb = pd.Series()
-    glucose = pd.Series()
+    empty_index = pd.to_datetime([], unit="s", utc=True)
+    empty_index = empty_index.tz_convert(frame.timezone)
+    empty = pd.Series([], index=empty_index)
+
+    insulin, carb, glucose = empty, empty, empty
 
     for series in frame.timeseries:
         if series.ctype in ["insulin", "basal", "bolus"]:
-            insulin = insulin.add(apply_insulin_curve(series) / 1000.0, fill_value=0)
+            insulin = insulin.add(apply_insulin_curve(
+                series) / 1000.0, fill_value=0)
         elif series.ctype == "carb":
             carb = carb.add(apply_carb_curve(series), fill_value=0)
         elif series.ctype == "glucose":
@@ -146,27 +177,19 @@ def make_pandas_frame(frame):
         else:
             raise Exception(f"unknown column type {coseriesl.ctype}")
 
-    return pd.DataFrame({"insulin": insulin, "carb": carb, "glucose": glucose,})
+    return pd.DataFrame({"insulin": insulin, "carb": carb, "glucose": glucose, })
 
 
 default_hyper_params = {
     # These are from a hyperparameter run 2019-12-06.
-    "fiasp_delay": 1.5897751528387287,
-    "fiasp_peak": 8.81492864510565,
-    "fiasp_time": 40.08144444874823,
-    "humalog_delay": 1.001781489035799,
-    "humalog_peak": 13.034515673823211,
-    "humalog_time": 40.73599998325823,
-    "maxdelta": 8.0,
+    "maxdelta": 5.0,
     "maxdelta_replace": math.nan,
     "delta_window": 1,
     # Rolling window of all inputs.
     "rolling_window": 8,
     "frame_limit": None,
-    # 'frame_limit': (0, 3),
-    "parameter_schedule_window_size": 12,
+    "quantile_loss_quantile": 0.5,
     "optimizer": "scipy.minimize",
-    # "optimizer": "adam",
 }
 
 
@@ -207,12 +230,12 @@ def make_frame(request, hyper_params=default_hyper_params):
     frame = frame[rows]
 
     # Filter carb and insulin outliers.
-    frame = frame[
-        (frame["insulin"] >= frame["insulin"].quantile(0.15))
-        & (frame["insulin"] <= frame["insulin"].quantile(0.85))
-    ]
-    carb_nonzero = frame[frame["carb"] > 0.0]["carb"]
-    frame = frame[frame["carb"] <= carb_nonzero.quantile(0.85)]
+    frame = frame[(frame["insulin"] > 0) & (frame["insulin"] <= frame["insulin"].quantile(0.90))]
+#        (frame["insulin"] >= frame["insulin"].quantile(0.05))
+#        & (frame["insulin"] <= frame["insulin"].quantile(0.85))
+#    ]
+    carb_quantile = frame[frame["carb"] > 0.0]["carb"].quantile(0.90)
+    frame = frame[frame["carb"] <= carb_quantile]
 
     return frame
 
@@ -239,7 +262,7 @@ def pack_params(indexed_params, nperiod=288):
         current = 0
         for index in indices:
             n = len(index)
-            unpacked.append(params[current : current + n])
+            unpacked.append(params[current: current + n])
             current += n
         return unpacked
 
@@ -259,15 +282,17 @@ def index_to_intervals(index, nperiod=288):
     return intervals
 
 
-def back_attribute(curve, index, target, nperiod=288):
+def identify_curve(curve, index, target, nperiod=288):
+    """Identity nperiod non-negative parameters that optimize the target
+    applied to curves."""
     assert curve.shape == (nperiod,), f"bad curve shape {curve.shape}"
     assert target.shape == (nperiod,), f"bad target shape {target.shape}"
     assert np.shape(index)[0] <= nperiod, f"bad index shape {index.shape}"
 
-    # First, create a [nperiod, nperiod] matrix X that computes the curve
-    # for each period. We then reduce this to a [nperiod, len(index)]
-    # matrix that sums contributions over each each window defined by
-    # the provided index.
+    # First, create a [nperiod, nperiod] matrix X that computes the
+    # curve for each period. We then reduce this to a [nperiod,
+    # len(index)] matrix that sums contributions over each each
+    # window (i.e., groups of columns) defined by the provided index.
 
     roll = np.zeros([nperiod, nperiod], dtype=int)
     curve_index = np.arange(nperiod)
@@ -286,22 +311,81 @@ def back_attribute(curve, index, target, nperiod=288):
     return x
 
 
+def attribute_parameters(curve, index, values, nparam=24, nperiod=288):
+    assert curve.shape == (nperiod,), f"bad curve shape {curve.shape}"
+
+    roll = np.zeros([nperiod, nperiod], dtype=int)
+    curve_index = np.flip(np.arange(nperiod))
+    for i in range(roll.shape[0]):
+        # Shape the curve at period i.
+        roll[i, :] = np.roll(curve_index, i+1)
+    X = curve[roll]
+
+    for i, ivs in enumerate(index_to_intervals(index, nperiod=nperiod)):
+        for beg, end in ivs:
+            X[:, beg:end] *= values[i]  # np.sum(X_rolled[:, beg:end], axis=1)
+    x = np.sum(X, axis=1)
+    x = np.mean(np.reshape(x, (nparam, nperiod//nparam)), axis=1)
+    return x
+
+
 def fit(request, hyper_params=default_hyper_params, nperiod=288):
+    passed_hyper_params = hyper_params
+    hyper_params = {}
+    hyper_params.update(passed_hyper_params)
+    hyper_params.update(request.hyper_params)
+
+    logging.info(f"fitting model with hyper parameters {hyper_params}")
+
     frame = make_frame(request, hyper_params=hyper_params)
+
+    basal_insulin_curve = expia1(
+        np.arange(nperiod),
+        request.basal_insulin_parameters.get("delay", 5.0) / 5.0,
+        request.basal_insulin_parameters["peak"] / 5.0,
+        request.basal_insulin_parameters["duration"] / 5.0,
+    )
+    # TODO: make this the average carb curve
+    default_carb_curve = carb_curve(np.arange(nperiod), 3, 36)
 
     # Set up parameter schedules.
     #
     # We arrange for each of basal, insulin sensitivity, and carb ratios
     # to have 24 windows in each day.
     #
-    # TODO: assign windows for carb ratios based on data density.
+    # TODO: assign windows for carb ratios based on data density
     #
-    # XXX: use averages here at least, and then forward project.
+    # TODO: find a better initialization strategy when no schedules are provided
     #
     # Order is: basals, insulin sensitivities, carb ratios
-    init_params = np.concatenate(
-        [np.zeros(24), np.ones(24) * 140.0, np.ones(24) * 15.0]
-    )
+    if request.insulin_sensitivity_schedule is not None:
+        init_insulin_sensitivity_params = attribute_parameters(
+            basal_insulin_curve,
+            request.insulin_sensitivity_schedule.index,
+            request.insulin_sensitivity_schedule.values)
+    else:
+        init_insulin_sensitivity_params = 140*np.ones(24)
+
+    if request.carb_ratio_schedule is not None:
+        init_carb_ratio_params = attribute_parameters(
+            default_carb_curve,
+            request.carb_ratio_schedule.index,
+            request.carb_ratio_schedule.values)
+    else:
+        init_carb_ratio_params = 15.*np.ones(24)
+
+    if request.basal_rate_schedule is not None:
+        init_basal_rate_params = attribute_parameters(
+            basal_insulin_curve,
+            request.basal_rate_schedule.index,
+            request.basal_rate_schedule.values)
+    else:
+        init_basal_rate_params = np.zeros(24)
+
+    init_params = np.concatenate([
+        init_basal_rate_params,
+        init_insulin_sensitivity_params,
+        init_carb_ratio_params])
 
     def unpack_params(params):
         return params[:24], params[24:48], params[48:72]
@@ -311,12 +395,21 @@ def fit(request, hyper_params=default_hyper_params, nperiod=288):
     deltas = frame["delta"].values
 
     hour = frame.index.hour
-    quantile = 0.5  # TODO: should be a hyperparameter
+    quantile = hyper_params["quantile_loss_quantile"]
 
-    # Up-weight
+    # Construct bounds based on the allowable tuning limit.
+    if request.tuning_limit is not None and request.tuning_limit > 0:
+        bounds = list(zip(init_params*(1-request.tuning_limit),
+                          init_params*1+request.tuning_limit))
+    else:
+        bounds = None
+
+    # Re-weight entries that have carbohydrate activity so that
+    # the model prefers having (much) better carb parameters
+    # over slightly worse-fitting sensitivity and basal parameters.
     weights = np.ones_like(deltas)
     weights[frame["carb"] > 0] = (
-        1.5 * np.sum(frame["carb"] > 0) / np.sum(frame["carb"] == 0)
+        np.sum(frame["carb"] == 0) / np.sum(frame["carb"] > 0)
     )
 
     def model(params):
@@ -324,17 +417,38 @@ def fit(request, hyper_params=default_hyper_params, nperiod=288):
         basal = basals[hour]
         insulin_sensitivity = insulin_sensitivities[hour]
         carb_ratio = carb_ratios[hour]
-        # carb_ratio = np.ones_like(carb_ratio)*15.0
         return insulin_sensitivity * (carbs / carb_ratio - insulin + basal)
+
+    if bounds is not None:
+        lower, upper = zip(*bounds)
+        lower, upper = np.array(lower), np.array(upper)
+        # This is a hack to get around the fact that basals are summed
+        # over multiple hours. Thus this is only an approximate bounds,
+        # but it's much simpler than the alternative.
+        insulin_duration_hours = request.basal_insulin_parameters["duration"] / 60.
+        lower[:24] = lower[:24]/insulin_duration_hours
+        upper[:24] = upper[:24]/insulin_duration_hours
 
     def loss(params, iter):
         preds = model(params)
-        basals, insulin_sensitivities, carb_ratios = unpack_params(params)
-        penalty = -10.0 * (
-            np.sum(np.minimum(basals, 0.0))
-            + np.sum(np.minimum(insulin_sensitivities, 0.0))
-            + np.sum(np.minimum(carb_ratios, 0.0))
-        )
+        penalty = -10.0 * np.sum(np.minimum(params, 0.0))
+
+        # Use a barrier function if bounds are provided.
+        if bounds is not None:
+            # HACK: simulate a "rectified" barrier function here.
+            # Note also that this doesn't work for basals since they
+            # are summed up.
+            epsilon = 0.00001
+            penalty_params = params.copy()
+            penalty_params[penalty_params >=
+                           upper] = upper[penalty_params > upper]-epsilon
+            penalty_params[penalty_params <=
+                           lower] = lower[penalty_params <= lower]+epsilon
+            penalty += np.sum(np.maximum(0., -0.01 *
+                                         np.log(upper-penalty_params)))
+            penalty += np.sum(np.maximum(0., -0.01 *
+                                         np.log(penalty_params-lower)))
+
         # Quantile regression: 50 pctile
         error = weights * (deltas - preds)
         return np.mean(np.maximum(quantile * error, (quantile - 1.0) * error)) + penalty
@@ -356,37 +470,32 @@ def fit(request, hyper_params=default_hyper_params, nperiod=288):
     # carb curve based on data. We also use the basal insulin
     # parameters for ISF schedules.
 
-    insulin_coeffs = expia1(
-        np.arange(nperiod),
-        request.basal_insulin_parameters.get("delay", 5.0) / 5.0,
-        request.basal_insulin_parameters["peak"] / 5.0,
-        request.basal_insulin_parameters["duration"] / 5.0,
-    )
     if request.basal_rate_schedule is None:
         # Default: hourly
         basal_rate_index = np.arange(0, 288, 12)
     else:
         basal_rate_index = request.basal_rate_schedule.reindexed(5)
     basal_rate_schedule = (
-        back_attribute(insulin_coeffs, basal_rate_index, np.repeat(basals, 12)) * 12
+        identify_curve(basal_insulin_curve, basal_rate_index,
+                       np.repeat(basals, 12)) * 12
     )
 
     if request.insulin_sensitivity_schedule is None:
         insulin_sensitivity_index = np.arange(0, 288, 12 * 4)
     else:
-        insulin_sensitivity_index = request.insulin_sensitivity_schedule.reindexed(5)
-    insulin_sensitivity_schedule = back_attribute(
-        insulin_coeffs, insulin_sensitivity_index, np.repeat(insulin_sensitivities, 12)
+        insulin_sensitivity_index = request.insulin_sensitivity_schedule.reindexed(
+            5)
+    insulin_sensitivity_schedule = identify_curve(
+        basal_insulin_curve, insulin_sensitivity_index, np.repeat(
+            insulin_sensitivities, 12)
     )
 
-    # TODO: use average from user data
-    carb_coeffs = walshca(np.arange(nperiod), 3, 36)
     if request.carb_ratio_schedule is None:
         carb_ratio_index = 12 * 6 + np.arange(0, 12 * 12, 4 * 12)
     else:
         carb_ratio_index = request.carb_ratio_schedule.reindexed(5)
-    carb_ratio_schedule = back_attribute(
-        carb_coeffs, carb_ratio_index, np.repeat(carb_ratios, 12)
+    carb_ratio_schedule = identify_curve(
+        default_carb_curve, carb_ratio_index, np.repeat(carb_ratios, 12)
     )
 
     # Finally, "quantize" the basal schedule if needed.
@@ -438,8 +547,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("file", type=str, nargs="?", help="file to read")
     parser.add_argument("--output", type=str, help="output to file")
+    for key, value in default_hyper_params.items():
+        parser.add_argument(f"--{key}", type=type(value),
+                            default=value, help=f"value for hyper parameter {key}")
 
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(format="%(asctime)s %(message)s", level=logging.INFO)
 
     args = parser.parse_args()
 
@@ -447,12 +559,19 @@ def main():
     if input is None:
         input = sys.stdin
     payload = json.load(input)
-    frame = codec.Request.fromdict(payload)
-    model = fit(frame)
+    request = codec.Request.fromdict(payload)
+    hyper_params = {}
+    hyper_params.update(default_hyper_params)
+    for key in hyper_params:
+        flag_value = args.__dict__[key]
+        if flag_value is not None:
+            hyper_params[key] = flag_value
+
+    model = fit(request, hyper_params=hyper_params)
 
     resp = codec.Response(
         version=1,
-        timezone=frame.timezone,
+        timezone=request.timezone,
         insulin_sensitivity_schedule=codec.Schedule.fromtuple(
             model.params["insulin_sensitivity_schedule"]
         ),

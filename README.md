@@ -87,6 +87,11 @@ entries.
 		"values": [0.25, ...],
 	}
 
+	// Optional parameter specifying the allowable parameter tuning range.
+	// If specified and greater than zero, it indicates the percentage of value
+	// that should be considered the tunable range.
+	"tuning_limit": 0.35,
+
 	// Timelines contains time-indexed data for all features relevant to
 	// modeling insulin and carbohydrate response.
 	"timelines": [

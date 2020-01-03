@@ -1,7 +1,8 @@
 """codec implements the column format described in this project's README.md"""
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any, Set
+import datetime
 
 import numpy as np
 import pandas as pd
@@ -70,12 +71,22 @@ class Request:
     allowed_basal_rates: Optional[List[float]] = None
 
     basal_insulin_parameters: Dict[str, float] = field(
-        default_factory=lambda: {"delay": 5, "peak": 65, "duration": 205,}
+        default_factory=lambda: {"delay": 5, "peak": 65, "duration": 205, }
     )
 
     insulin_sensitivity_schedule: Optional[Schedule] = None
     carb_ratio_schedule: Optional[Schedule] = None
     basal_rate_schedule: Optional[Schedule] = None
+
+    # If specified, limits the amount of deviation allowed from
+    # the above parameters.
+    tuning_limit: Optional[float] = None
+
+    hyper_params: Dict[str, Any] = field(default_factory=lambda: {})
+
+    # The set of parameters to tune. If it is not specified,
+    # all parameters are tuned.
+    tune_parameters: Optional[Set[str]] = None
 
     def fromdict(payload) -> "Request":
         """Decode a JSON payload into a Request."""
@@ -88,12 +99,21 @@ class Request:
         if timezone is None:
             raise MissingFieldError("timezone")
 
+        # iOS has the habit of sending timezone offsets.
+        if timezone.startswith("GMT-") or timezone.startswith("GMT+"):
+            delta = datetime.timedelta(
+                hours=int(timezone[4:6]), minutes=int(timezone[6:8]))
+            if timezone[3] == "-":
+                delta = -delta
+            timezone = datetime.timezone(delta)
+
         raw_timelines = payload.get("timelines")
         if raw_timelines is None:
             raise MissingFieldError("timelines")
 
         minimum_time_interval = payload.get("minimum_time_interval")
-        maximum_schedule_item_count = payload.get("maximum_schedule_item_count")
+        maximum_schedule_item_count = payload.get(
+            "maximum_schedule_item_count")
         allowed_basal_rates = payload.get("allowed_basal_rates")
 
         insulin_sensitivity_schedule = None
@@ -103,10 +123,12 @@ class Request:
             )
         carb_ratio_schedule = None
         if "carb_ratio_schedule" in payload:
-            carb_ratio_schedule = Schedule.fromdict(payload["carb_ratio_schedule"])
+            carb_ratio_schedule = Schedule.fromdict(
+                payload["carb_ratio_schedule"])
         basal_rate_schedule = None
         if "basal_rate_schedule" in payload:
-            basal_rate_schedule = Schedule.fromdict(payload["basal_rate_schedule"])
+            basal_rate_schedule = Schedule.fromdict(
+                payload["basal_rate_schedule"])
 
         basal_insulin_parameters = payload.get("basal_insulin_parameters", {})
 
@@ -114,10 +136,13 @@ class Request:
         for index, timeline in enumerate(raw_timelines):
             series_type = timeline["type"]
             if not series_type in ["bolus", "basal", "insulin", "carb", "glucose"]:
-                raise Exception(f"series {index}: invalid series type {series_type}")
+                raise Exception(
+                    f"series {index}: invalid series type {series_type}")
             params = timeline.get("parameters", {})
             index = undelta(timeline["index"])
             values = undelta(timeline["values"])
+            if len(index) == 0:
+                continue
             if "durations" in timeline:
                 durations = undelta(timeline["durations"])
                 index, values = resample(index, values, durations)
@@ -125,6 +150,10 @@ class Request:
             index = index.tz_convert(timezone)
             series = pd.Series(values, index)
             timeseries.append(Timeseries(series_type, params, series))
+
+        tune_parameters = payload.get("tune_parameters")
+        if tune_parameters is not None:
+            tune_parameters = set(tune_parameters)
 
         return Request(
             timezone=timezone,
@@ -136,6 +165,9 @@ class Request:
             insulin_sensitivity_schedule=insulin_sensitivity_schedule,
             carb_ratio_schedule=carb_ratio_schedule,
             basal_rate_schedule=basal_rate_schedule,
+            tuning_limit=payload.get("tuning_limit"),
+            hyper_params=payload.get("hyper_params", {}),
+            tune_parameters=tune_parameters,
         )
 
 

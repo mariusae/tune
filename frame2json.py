@@ -89,6 +89,13 @@ def main():
 
     frame = read_and_clean_data(input)
 
+    def make_schedule(*args):
+        index, values = zip(*args)
+        return {
+            "index": list(index),
+            "values": list(values),
+        }
+
     payload = json.dumps(
         {
             "version": 1,
@@ -115,24 +122,40 @@ def main():
                     {"delay": 8, "peak": 44, "duration": 200},
                     frame["insulin_fiasp"],
                 ),
-                timeline("carb", {"delay": 10, "duration": 30}, frame["uciXS"]),
+                timeline(
+                    "carb", {"delay": 10, "duration": 30}, frame["uciXS"]),
                 timeline("carb", {"delay": 15, "duration": 60}, frame["uciS"]),
-                timeline("carb", {"delay": 15, "duration": 120}, frame["uciM"]),
-                timeline("carb", {"delay": 15, "duration": 180}, frame["uciL"]),
+                timeline(
+                    "carb", {"delay": 15, "duration": 120}, frame["uciM"]),
+                timeline(
+                    "carb", {"delay": 15, "duration": 180}, frame["uciL"]),
             ],
-            "insulin_sensitivity_schedule": {
-                "index": [360, 720, 900, 1080],
-                "values": [140, 100, 100, 120],
-            },
-            "basal_rate_schedule": {
-                "index": [180, 360, 600, 1200, 1320],
-                "values": [0.2, 0.1, 0.6, 0.7, 0.3],
-            },
+            "insulin_sensitivity_schedule": make_schedule(
+                (0, 140),
+                (3*60, 140),
+                (6*60, 100),
+                (8*60, 90),
+                (12*60, 100),
+                (15*60, 120),
+                (22*60, 140),
+            ),
+            "basal_rate_schedule": make_schedule(
+                (0, 0.2),
+                (3*60, 0.1),
+                (6*60, 0.5),
+                (10*60, 0.3),
+                (14*60, 0.25),
+                (17*60, 0.20),
+                (20*60, 0.15),
+            ),
             #            "carb_ratio_schedule": {"index": [72, 120, 216], "values": [8, 15, 18],},
-            "carb_ratio_schedule": {
-                "index": [0, 6 * 60, 9 * 60, 12 * 60, 15 * 60, 19 * 60],
-                "values": [15, 15, 15, 15, 5, 15],
-            },
+            "carb_ratio_schedule": make_schedule(
+                (0, 15),
+                (7*60, 8),
+                (9*60, 14),
+                (19*60, 20),
+            ),
+            "tuning_limit": 0.35,
         }
     )
 
