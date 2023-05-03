@@ -1,6 +1,6 @@
 Flask==2.3.2
 gunicorn==19.9.0
-numpy==1.17.2
+numpy==1.22.0
 scipy==1.4.0
 pandas==0.25.3
 autograd==1.3
